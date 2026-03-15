@@ -43,40 +43,69 @@ usage() {
   echo "  --org ORG    GitHub organization to scan (can be repeated)"
   echo "  --user USER  GitHub user to scan (can be repeated)"
   echo "  -h, --help   Show this help"
-  exit 0
+  exit "${1:-0}"
 }
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --org)   ORGS+=("$2"); shift 2 ;;
-      --user)  USERS+=("$2"); shift 2 ;;
+      --org)
+        if [[ $# -lt 2 || -z "$2" ]]; then
+          echo "Error: --org requires an argument" >&2
+          exit 1
+        fi
+        ORGS+=("$2"); shift 2 ;;
+      --user)
+        if [[ $# -lt 2 || -z "$2" ]]; then
+          echo "Error: --user requires an argument" >&2
+          exit 1
+        fi
+        USERS+=("$2"); shift 2 ;;
       -h|--help) usage ;;
-      *) echo "Unknown option: $1"; usage ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage 1
+        ;;
     esac
   done
 
   if [[ ${#ORGS[@]} -eq 0 && ${#USERS[@]} -eq 0 ]]; then
-    echo "Error: specify at least one --org or --user"
+    echo "Error: specify at least one --org or --user" >&2
     exit 1
   fi
 }
 
 gather_repos() {
-  if [[ ${#ORGS[@]} -gt 0 ]]; then
-    for org in "${ORGS[@]}"; do
-      while IFS= read -r repo; do
-        REPOS+=("$repo")
-      done < <(gh repo list "$org" --limit 200 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)
-    done
-  fi
-  if [[ ${#USERS[@]} -gt 0 ]]; then
-    for user in "${USERS[@]}"; do
-      while IFS= read -r repo; do
-        REPOS+=("$repo")
-      done < <(gh repo list "$user" --limit 200 --json nameWithOwner --jq '.[].nameWithOwner' 2>/dev/null)
-    done
-  fi
+  _list_repos() {
+    local kind="$1" name="$2"
+    local gh_output
+    if ! gh_output=$(gh repo list "$name" --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner' 2>&1); then
+      echo -e "${YELLOW}Warning:${NC} failed to list repos for ${kind} '${name}':" >&2
+      echo "$gh_output" >&2
+      return
+    fi
+    while IFS= read -r repo; do
+      REPOS+=("$repo")
+    done <<< "$gh_output"
+  }
+
+  for org in "${ORGS[@]}"; do
+    _list_repos "org" "$org"
+  done
+  for user in "${USERS[@]}"; do
+    _list_repos "user" "$user"
+  done
+}
+
+decode_base64() {
+  local input="$1"
+  # Try GNU base64 -d first, fall back to BSD/macOS base64 -D, then Python 3
+  echo "$input" | base64 -d 2>/dev/null && return
+  echo "$input" | base64 -D 2>/dev/null && return
+  echo "$input" | python3 -c '
+import sys, base64
+sys.stdout.write(base64.b64decode(sys.stdin.read()).decode())
+' 2>/dev/null
 }
 
 add_finding() {
@@ -147,7 +176,8 @@ check_comment_trigger() {
 
   # Pattern 3: issue_comment trigger without author_association check
   if echo "$content" | grep -q 'issue_comment'; then
-    if ! echo "$content" | grep -qE 'author_association|OWNER|MEMBER|COLLABORATOR'; then
+    # Look specifically for a conditional on github.event.comment.author_association
+    if ! echo "$content" | grep -qE 'github\.event\.comment\.author_association'; then
       # Check if it does anything privileged (checkout, run scripts, etc.)
       if echo "$content" | grep -qE 'actions/checkout|run:'; then
         add_finding "$repo" "$workflow_path" "HIGH" "UNAUTH_COMMENT_TRIGGER" \
@@ -209,6 +239,8 @@ scan_repo() {
   local repo="$1"
   local has_vulns=false
 
+  ((TOTAL_REPOS_SCANNED++)) || true
+
   # Get list of workflow files
   local workflows
   workflows=$(gh api "repos/${repo}/contents/.github/workflows" --jq '.[].name' 2>/dev/null || true)
@@ -217,14 +249,23 @@ scan_repo() {
     return
   fi
 
-  ((TOTAL_REPOS_SCANNED++)) || true
-
   while IFS= read -r wf; do
     [[ -z "$wf" ]] && continue
     [[ "$wf" != *.yml && "$wf" != *.yaml ]] && continue
 
+    local raw_content
+    raw_content=$(gh api "repos/${repo}/contents/.github/workflows/${wf}" --jq '.content' 2>/dev/null || true)
+
+    if [[ -z "$raw_content" ]]; then
+      continue
+    fi
+
     local content
-    content=$(gh api "repos/${repo}/contents/.github/workflows/${wf}" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
+    # Try GNU base64 -d first, fall back to BSD/macOS base64 -D, then Python
+    if ! content=$(decode_base64 "$raw_content"); then
+      echo "Warning: failed to decode base64 workflow content for ${repo}/${wf}" >&2
+      continue
+    fi
 
     if [[ -z "$content" ]]; then
       continue
@@ -340,7 +381,7 @@ main() {
     local repo_findings=0
     if [[ ${#FINDINGS[@]} -gt 0 ]]; then
       for finding in "${FINDINGS[@]}"; do
-        if echo "$finding" | grep -q "|${repo}|"; then
+        if echo "$finding" | grep -F -q "|${repo}|"; then
           ((repo_findings++)) || true
         fi
       done
