@@ -4,14 +4,16 @@
 # Scans all repos under specified GitHub orgs/users for GitHub Actions
 # workflow vulnerabilities exploited by the hackerbot-claw campaign.
 #
-# Checks for 5 attack patterns:
+# Checks for multiple attack patterns, including:
 #   1. Pwn Request: pull_request_target + checkout of PR head code
 #   2. Script Injection: unescaped ${{ }} expressions in run: blocks
 #   3. Unprivileged comment triggers: issue_comment without author_association check
 #   4. Excessive permissions: contents: write on PR-triggered workflows
-#   5. Unsafe AI/bot triggers: claude-code-action with allowed_non_write_users: '*'
+#   5. Unsafe AI/bot triggers and prompt injection into AI/bot steps
+#   6. Missing explicit permissions blocks on workflows
+#   7. Injection of untrusted input into workflow commands or configuration
 #
-# Usage: ./scan-gha-vulnerabilities.sh [--fix] [--org ORG ...] [--user USER ...]
+# Usage: ./scan-gha-vulnerabilities.sh [--org ORG ...] [--user USER ...]
 #
 # Requires: gh CLI (authenticated)
 
